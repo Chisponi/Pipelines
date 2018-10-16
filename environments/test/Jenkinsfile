@@ -1,0 +1,108 @@
+@Library("pipeline-library") 
+import com.redhat.openshift.pipelines.Commons
+
+def commons = new Commons(this)
+
+pipeline {
+    agent any
+    options {
+        skipDefaultCheckout()
+        disableConcurrentBuilds()
+    }
+    stages {
+        stage("Initialize") {
+            steps {
+                script {
+                    if (!env.IMAGE_NAME)
+                        env.IMAGE_NAME = env.APP_NAME
+
+                    // Gets the application project
+                    env.PROJECT = commons.getApplicationProject()      
+                }
+            }
+        }
+        stage("Select Tag") {
+            when {
+                not {
+                    expression {
+                        return env.TAG
+                    }
+                }
+            }
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject(env.SRC_PROJECT) {
+                            // Generates a list of tags to deploy
+                            env.TAG = commons.getVersion(env.APP_NAME)
+                            // Checkout same tag from Git
+                            env.GIT_BRANCH = env.TAG
+                        }
+                    }
+                }
+            }
+        }
+        stage("Checkout Code") {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject(env.PROJECT) {
+                            commons.gitCheckout(env.GIT_REPO, env.GIT_BRANCH, env.GIT_SECRET)
+                        }
+                    }
+                }
+            }
+        }
+        stage("Promote Template") {
+            when {
+                not {
+                    expression {
+                        return env.APP_TEMPLATE_FILE.equals("none")
+                    }
+                }
+            }
+            steps {
+                script {
+                    openshift.withCluster {
+                        openshift.withProject(env.PROJECT) {
+                            // Uses the template to create the application
+                            openshift.apply(commons.processTemplateWithoutBuildObjects(env.APP_TEMPLATE_FILE, env.APP_NAME, env.IMAGE_NAME))
+                        }
+                    }
+                }
+            }
+        }
+        stage("Promote Tag") {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject(env.PROJECT) {
+                            // Tags image from development to test, this operation creates the ImageStream
+                            openshift.tag("${env.SRC_PROJECT}/${env.IMAGE_NAME}:${env.TAG}", "${env.IMAGE_NAME}:${env.TAG}")
+                        }
+                    } 
+                }
+            }
+        }
+        stage("Approve Deploy") {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        commons.resolveApproval(env.APPROVAL_GROUP)
+                    }
+                }
+            }
+        }
+        stage("Deploy Application") {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject(env.PROJECT) {
+                            commons.deployApplication(env.APP_NAME, env.IMAGE_NAME, env.TAG)
+                        } 
+                    }
+                }
+            }
+        }
+    }
+}

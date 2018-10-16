@@ -1,0 +1,115 @@
+@Library("pipeline-library") 
+import com.redhat.openshift.pipelines.Commons
+
+def commons = new Commons(this)
+
+pipeline {
+    agent any
+    options {
+        skipDefaultCheckout()
+        disableConcurrentBuilds()
+    }
+    stages {
+        stage("Initialize") {
+            steps {
+                script {
+                    if (!env.IMAGE_NAME)
+                        env.IMAGE_NAME = env.APP_NAME
+
+                    // Gets the application project
+                    env.PROJECT = commons.getApplicationProject()
+                }
+            }
+        }
+        stage("Select Tag") {
+            when {
+                not {
+                    expression {
+                        return env.TAG
+                    }
+                }
+            }
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject(env.SRC_PROJECT) {
+                            // Generates a list of tags to deploy
+                            env.TAG = commons.getVersion(env.APP_NAME)
+                            // Checkout same tag from Git
+                            env.GIT_BRANCH = env.TAG
+                        }
+                    }
+                }
+            }
+        }
+        stage("Checkout Code") {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        openshift.withProject(env.PROJECT) {
+                            commons.gitCheckout(env.GIT_REPO, env.GIT_BRANCH, env.GIT_SECRET)
+                        }
+                    }
+                }
+            }
+        }
+        stage("Promote Template") {
+            when {
+                not {
+                    expression {
+                        return env.APP_TEMPLATE_FILE.equals("none")
+                    }
+                }
+            }
+            steps {
+                script {
+                    openshift.withCluster(env.DST_CLUSTER_URL, env.DST_CLUSTER_TOKEN) {
+                        openshift.withProject(env.DST_PROJECT) {
+                             // Uses the template to create the application
+                            openshift.apply(commons.processTemplateWithoutBuildObjects(env.APP_TEMPLATE_FILE, env.APP_NAME, env.IMAGE_NAME))
+                        }
+                    }
+                }
+            }
+        }
+        stage("Promote Tag") {
+            agent {
+                label "skopeo"
+            }
+            steps {
+                script {
+                    // Credentials
+                    def srcCreds = "unused:${env.SRC_REGISTRY_TOKEN}";
+                    def dstCreds = "unused:${env.DST_REGISTRY_TOKEN}";
+
+                    // Paths 
+                    def src = "${env.SRC_REGISTRY_URL}/${env.SRC_PROJECT}/${env.IMAGE_NAME}:${env.TAG}";
+                    def dst = "${env.DST_REGISTRY_URL}/${env.DST_PROJECT}/${env.IMAGE_NAME}:${env.TAG}";
+
+                    // Executes the Skopeo command
+                    sh "skopeo copy --src-tls-verify=false --dest-tls-verify=false --src-creds=${srcCreds} --dest-creds=${dstCreds} ${src} ${dst}";
+                }
+            }
+        }
+        stage("Approve Deploy") {
+            steps {
+                script {
+                    openshift.withCluster() {
+                        commons.resolveApproval(env.APPROVAL_GROUP)
+                    }
+                }
+            }
+        }
+        stage("Deploy Application") {
+            steps {
+                script {
+                    openshift.withCluster(env.DST_CLUSTER_URL, env.DST_CLUSTER_TOKEN) {
+                        openshift.withProject(env.DST_PROJECT) {
+                            commons.deployApplication(env.APP_NAME, env.IMAGE_NAME, env.TAG)
+                        } 
+                    }
+                }
+            }
+        }
+    }
+}
